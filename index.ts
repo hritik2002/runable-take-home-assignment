@@ -2,328 +2,243 @@ import Anthropic from "@anthropic-ai/sdk";
 import { initDb } from "./db/index.js";
 import { getOrCreateSession, saveMessage, loadMessages, saveCompactedMessages } from "./session.js";
 import { ensureDockerContainer, execInContainer, checkContainerHealth } from "./docker.js";
-import { shouldCompact, compactMessages } from "./compaction.js";
+import { shouldCompact, isContextOverflowError, compactMessages, type CoreMessage } from "./compaction.js";
 import { readFile, writeFile, mkdir, readdir, stat } from "fs/promises";
 import { existsSync } from "fs";
 import { join } from "path";
 
-const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
+const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY! });
+const sessionId = process.argv[2];
 
-if (!ANTHROPIC_API_KEY) {
-  console.error("❌ ANTHROPIC_API_KEY environment variable is required");
-  process.exit(1);
-}
+const SYSTEM_PROMPT = `You are a helpful coding assistant with access to a Docker container.
+Available tools: readFile, writeFile, listDirectory, executeCommand.
+Be concise. Test your code. Handle errors gracefully.`;
 
-const client = new Anthropic({ apiKey: ANTHROPIC_API_KEY });
-
-// Get session ID from command line or create new one
-const sessionId = process.argv[2] || undefined;
-
-const WORK_DIR = "/workspace";
-
-// Tool definitions for Anthropic API
-const toolDefinitions: Anthropic.Tool[] = [
+const TOOLS: Anthropic.Tool[] = [
   {
     name: "readFile",
-    description: "Read the contents of a file",
+    description: "Read file contents",
     input_schema: {
       type: "object" as const,
-      properties: {
-        path: { type: "string", description: "The path to the file to read" },
-      },
+      properties: { path: { type: "string" } },
       required: ["path"],
     },
   },
   {
     name: "writeFile",
-    description: "Write content to a file",
+    description: "Write content to file",
     input_schema: {
       type: "object" as const,
-      properties: {
-        path: { type: "string", description: "The path to the file to write" },
-        content: { type: "string", description: "The content to write to the file" },
+      properties: { 
+        path: { type: "string" }, 
+        content: { type: "string" } 
       },
       required: ["path", "content"],
     },
   },
   {
     name: "listDirectory",
-    description: "List files and directories in a path. Use '.' for current directory.",
+    description: "List directory contents",
     input_schema: {
       type: "object" as const,
-      properties: {
-        path: { type: "string", description: "The directory path to list, use '.' for current directory" },
-      },
+      properties: { path: { type: "string" } },
       required: ["path"],
     },
   },
   {
     name: "executeCommand",
-    description: "Execute a shell command in the Docker container",
+    description: "Execute shell command in Docker container",
     input_schema: {
       type: "object" as const,
-      properties: {
-        command: { type: "string", description: "The shell command to execute" },
-      },
+      properties: { command: { type: "string" } },
       required: ["command"],
     },
   },
 ];
 
-// Tool execution functions
-async function executeTool(
-  toolName: string,
-  toolInput: Record<string, any>,
-  containerId: string
-): Promise<string> {
-  switch (toolName) {
-    case "readFile": {
-      try {
-        let path = toolInput.path as string;
-        if (path.startsWith("/")) path = path.slice(1);
-        const fullPath = join(process.cwd(), path);
-        const content = await readFile(fullPath, "utf-8");
+async function executeTool(name: string, input: any, containerId: string): Promise<string> {
+  try {
+    switch (name) {
+      case "readFile": {
+        const path = input.path.startsWith("/") ? input.path.slice(1) : input.path;
+        const content = await readFile(join(process.cwd(), path), "utf-8");
         return JSON.stringify({ success: true, content });
-      } catch (error: any) {
-        return JSON.stringify({ success: false, error: error.message });
       }
-    }
-    case "writeFile": {
-      try {
-        let path = toolInput.path as string;
-        const content = toolInput.content as string;
-        if (path.startsWith("/")) path = path.slice(1);
+      case "writeFile": {
+        const path = input.path.startsWith("/") ? input.path.slice(1) : input.path;
         const fullPath = join(process.cwd(), path);
         const dir = fullPath.substring(0, fullPath.lastIndexOf("/"));
-        if (dir && !existsSync(dir)) {
-          await mkdir(dir, { recursive: true });
-        }
-        await writeFile(fullPath, content, "utf-8");
-        return JSON.stringify({ success: true, message: `File written to ${path}` });
-      } catch (error: any) {
-        return JSON.stringify({ success: false, error: error.message });
+        if (dir && !existsSync(dir)) await mkdir(dir, { recursive: true });
+        await writeFile(fullPath, input.content, "utf-8");
+        return JSON.stringify({ success: true });
       }
-    }
-    case "listDirectory": {
-      try {
-        let path = toolInput.path as string;
-        if (path.startsWith("/")) path = path.slice(1);
+      case "listDirectory": {
+        const path = input.path.startsWith("/") ? input.path.slice(1) : input.path;
         const fullPath = path === "." ? process.cwd() : join(process.cwd(), path);
         const entries = await readdir(fullPath);
-        const results = await Promise.all(
-          entries.map(async (entry) => {
-            const entryPath = join(fullPath, entry);
-            const stats = await stat(entryPath);
-            return {
-              name: entry,
-              type: stats.isDirectory() ? "directory" : "file",
-              size: stats.size,
-            };
-          })
-        );
+        const results = await Promise.all(entries.map(async name => {
+          const s = await stat(join(fullPath, name));
+          return { name, type: s.isDirectory() ? "dir" : "file", size: s.size };
+        }));
         return JSON.stringify({ success: true, entries: results });
-      } catch (error: any) {
-        return JSON.stringify({ success: false, error: error.message });
       }
-    }
-    case "executeCommand": {
-      try {
-        const command = toolInput.command as string;
-        const result = await execInContainer(containerId, command);
-        return JSON.stringify({
-          success: true,
-          stdout: result.stdout,
-          stderr: result.stderr,
-          exitCode: result.stderr ? 1 : 0,
-        });
-      } catch (error: any) {
-        if (error.message.includes("Container crashed")) {
-          return JSON.stringify({
-            success: false,
-            error: "Container crashed. It will be recreated on the next command.",
-            containerCrashed: true,
-          });
-        }
-        return JSON.stringify({ success: false, error: error.message });
+      case "executeCommand": {
+        const result = await execInContainer(containerId, input.command);
+        return JSON.stringify({ success: true, ...result });
       }
+      default:
+        return JSON.stringify({ error: "Unknown tool" });
     }
-    default:
-      return JSON.stringify({ error: `Unknown tool: ${toolName}` });
+  } catch (e: any) {
+    return JSON.stringify({ success: false, error: e.message });
   }
 }
 
-type Message = Anthropic.MessageParam;
+async function chat(
+  messages: Anthropic.MessageParam[],
+  containerId: string
+): Promise<{ response: string; inputTokens: number; outputTokens: number }> {
+  let currentMsgs = [...messages];
+  let fullResponse = "";
+  let totalInput = 0;
+  let totalOutput = 0;
 
-async function main() {
-  console.log("🤖 Context-Compacting Coding Agent");
-  console.log("===================================\n");
+  while (true) {
+    const res = await client.messages.create({
+      model: "claude-sonnet-4-20250514",
+      max_tokens: 8096,
+      system: SYSTEM_PROMPT,
+      tools: TOOLS,
+      messages: currentMsgs,
+    });
 
-  // Initialize database
-  initDb();
-  console.log("✅ Database initialized\n");
+    totalInput = res.usage.input_tokens; // Last call's input = full context
+    totalOutput += res.usage.output_tokens;
 
-  // Get or create session
-  const currentSessionId = await getOrCreateSession(sessionId);
-  if (sessionId && sessionId === currentSessionId) {
-    console.log(`📂 Resuming session: ${currentSessionId}\n`);
-  } else {
-    console.log(`📂 New session: ${currentSessionId}\n`);
+    let hasToolUse = false;
+    const toolResults: Anthropic.ToolResultBlockParam[] = [];
+
+    for (const block of res.content) {
+      if (block.type === "text") {
+        process.stdout.write(block.text);
+        fullResponse += block.text;
+      } else if (block.type === "tool_use") {
+        hasToolUse = true;
+        console.log(`\n🔧 ${block.name}`);
+        const result = await executeTool(block.name, block.input, containerId);
+        console.log(`   → ${result.slice(0, 80)}${result.length > 80 ? "..." : ""}`);
+        toolResults.push({ type: "tool_result", tool_use_id: block.id, content: result });
+      }
+    }
+
+    if (!hasToolUse || res.stop_reason === "end_turn") break;
+    
+    currentMsgs.push({ role: "assistant", content: res.content });
+    currentMsgs.push({ role: "user", content: toolResults });
   }
 
-  // Ensure Docker container is running
+  return { response: fullResponse, inputTokens: totalInput, outputTokens: totalOutput };
+}
+
+async function main() {
+  console.log("🤖 Context-Compacting Coding Agent\n");
+
+  initDb();
+  const currentSessionId = await getOrCreateSession(sessionId);
+  console.log(`📂 Session: ${currentSessionId}`);
+
   let containerId: string;
   try {
     containerId = await ensureDockerContainer(currentSessionId);
-    console.log(`🐳 Docker container ready: ${containerId.substring(0, 12)}\n`);
-  } catch (error: any) {
-    console.error("❌ Failed to set up Docker container:", error.message);
-    console.error("   Make sure Docker is running and accessible.");
+    console.log(`🐳 Docker: ${containerId.slice(0, 12)}\n`);
+  } catch (e: any) {
+    console.error("❌ Docker failed:", e.message);
     process.exit(1);
   }
 
-  // System prompt
-  const systemPrompt = `You are a helpful coding assistant. You can read and write files, execute commands in a Docker container, and help with programming tasks.
+  // Load saved messages
+  const saved = await loadMessages(currentSessionId);
+  let messages: Anthropic.MessageParam[] = saved
+    .filter(m => m.role !== "system")
+    .map(m => ({ role: m.role as "user" | "assistant", content: m.content }));
 
-The Docker container is running and ready. You can execute commands using the executeCommand tool.
-The workspace directory in the container is ${WORK_DIR}.
+  let lastInputTokens = 0;
 
-When working on tasks:
-1. Break down complex tasks into smaller steps
-2. Test your code as you go
-3. Provide clear explanations of what you're doing
-4. Handle errors gracefully`;
-
-  // Load existing messages
-  const savedMessages = await loadMessages(currentSessionId);
-  let messages: Message[] = savedMessages.filter(m => m.role !== "system").map(m => ({
-    role: m.role as "user" | "assistant",
-    content: m.content as string,
-  }));
-
-  // Main agent loop
-  const readline = await import("readline");
-  const rl = readline.createInterface({
+  const rl = (await import("readline")).createInterface({
     input: process.stdin,
     output: process.stdout,
   });
+  const ask = (q: string) => new Promise<string>(r => rl.question(q, r));
 
-  const question = (prompt: string): Promise<string> => {
-    return new Promise((resolve) => {
-      rl.question(prompt, resolve);
-    });
-  };
-
-  console.log("💬 Agent ready! Type your message (or 'exit' to quit):\n");
+  console.log("💬 Ready! ('exit' to quit)\n");
 
   while (true) {
-    const userInput = await question("You: ");
-    
-    if (userInput.toLowerCase() === "exit") {
-      console.log("\n👋 Goodbye!");
-      break;
-    }
+    const input = await ask("You: ");
+    if (input.toLowerCase() === "exit") break;
+    if (!input.trim()) continue;
 
-    if (!userInput.trim()) {
-      continue;
-    }
+    await saveMessage(currentSessionId, "user", input);
+    messages.push({ role: "user", content: input });
 
-    // Save user message
-    await saveMessage(currentSessionId, "user", userInput);
-    messages.push({ role: "user", content: userInput });
-
-    // Check if we need to compact
-    const coreMessages = messages.map(m => ({ 
-      role: m.role, 
-      content: typeof m.content === "string" ? m.content : JSON.stringify(m.content) 
-    }));
-    if (shouldCompact(coreMessages)) {
-      const compacted = await compactMessages(coreMessages);
-      await saveCompactedMessages(currentSessionId, compacted);
-      messages = compacted.filter(m => m.role !== "system").map(m => ({
-        role: m.role as "user" | "assistant",
-        content: m.content as string,
-      }));
-    }
-
-    // Ensure container is still healthy
+    // Check container health
     if (!(await checkContainerHealth(containerId))) {
-      console.log("⚠️  Container crashed, recreating...");
+      console.log("⚠️ Recreating container...");
       containerId = await ensureDockerContainer(currentSessionId);
-      console.log(`🐳 Container recreated: ${containerId.substring(0, 12)}\n`);
     }
 
-    try {
-      let currentMessages = [...messages];
-      let finalResponse = "";
-      
-      // Agentic loop - keep running until no more tool calls
-      while (true) {
-        const response = await client.messages.create({
-          model: "claude-sonnet-4-20250514",
-          max_tokens: 8096,
-          system: systemPrompt,
-          tools: toolDefinitions,
-          messages: currentMessages,
-        });
+    // Retry loop with compaction on overflow
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        const { response, inputTokens, outputTokens } = await chat(messages, containerId);
+        lastInputTokens = inputTokens;
 
-        // Process the response
-        let hasToolUse = false;
-        const toolResults: Anthropic.ToolResultBlockParam[] = [];
-        
-        for (const block of response.content) {
-          if (block.type === "text") {
-            process.stdout.write(block.text);
-            finalResponse += block.text;
-          } else if (block.type === "tool_use") {
-            hasToolUse = true;
-            console.log(`\n🔧 Using tool: ${block.name}`);
-            
-            const result = await executeTool(block.name, block.input as Record<string, any>, containerId);
-            console.log(`   Result: ${result.substring(0, 100)}${result.length > 100 ? "..." : ""}`);
-            
-            toolResults.push({
-              type: "tool_result",
-              tool_use_id: block.id,
-              content: result,
-            });
-
-            // Check if container crashed
-            const parsed = JSON.parse(result);
-            if (parsed.containerCrashed) {
-              containerId = await ensureDockerContainer(currentSessionId);
-              console.log(`\n🐳 Container recreated: ${containerId.substring(0, 12)}`);
-            }
-          }
+        if (response.trim()) {
+          await saveMessage(currentSessionId, "assistant", response);
+          messages.push({ role: "assistant", content: response });
         }
 
-        // If there were tool uses, add them and results to messages and continue
-        if (hasToolUse) {
-          currentMessages.push({ role: "assistant", content: response.content });
-          currentMessages.push({ role: "user", content: toolResults });
-        }
+        console.log(`\n📊 ${inputTokens.toLocaleString()} in / ${outputTokens.toLocaleString()} out\n`);
 
-        // If stop reason is end_turn or no more tool calls, we're done
-        if (response.stop_reason === "end_turn" || !hasToolUse) {
+        // Proactive compaction for next turn
+        if (shouldCompact(lastInputTokens)) {
+          console.log("⚠️ Approaching limit, compacting...");
+          const core: CoreMessage[] = messages.map(m => ({
+            role: m.role,
+            content: typeof m.content === "string" ? m.content : JSON.stringify(m.content),
+          }));
+          const compacted = await compactMessages(core);
+          await saveCompactedMessages(currentSessionId, compacted);
+          messages = compacted.filter(m => m.role !== "system").map(m => ({
+            role: m.role as "user" | "assistant",
+            content: m.content,
+          }));
+        }
+        break; // Success, exit retry loop
+
+      } catch (error: any) {
+        if (isContextOverflowError(error) && attempt === 0) {
+          console.log("\n🚨 Context overflow! Compacting and retrying...");
+          const core: CoreMessage[] = messages.map(m => ({
+            role: m.role,
+            content: typeof m.content === "string" ? m.content : JSON.stringify(m.content),
+          }));
+          const compacted = await compactMessages(core, 4); // Keep fewer messages
+          await saveCompactedMessages(currentSessionId, compacted);
+          messages = compacted.filter(m => m.role !== "system").map(m => ({
+            role: m.role as "user" | "assistant",
+            content: m.content,
+          }));
+        } else {
+          console.error("\n❌", error.message);
+          messages.push({ role: "assistant", content: `Error: ${error.message}` });
           break;
         }
       }
-
-      // Save final response
-      if (finalResponse.trim()) {
-        await saveMessage(currentSessionId, "assistant", finalResponse);
-        messages.push({ role: "assistant", content: finalResponse });
-      }
-
-      console.log("\n");
-    } catch (error: any) {
-      console.error("\n❌ Error:", error.message);
-      const errorMessage = `Error: ${error.message}`;
-      await saveMessage(currentSessionId, "assistant", errorMessage);
-      messages.push({ role: "assistant", content: errorMessage });
     }
   }
 
   rl.close();
+  console.log("\n👋 Bye!");
 }
 
 main().catch(console.error);

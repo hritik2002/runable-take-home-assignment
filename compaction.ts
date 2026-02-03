@@ -1,93 +1,83 @@
 import Anthropic from "@anthropic-ai/sdk";
 
-const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
+const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY! });
 
-if (!ANTHROPIC_API_KEY) {
-  throw new Error("ANTHROPIC_API_KEY environment variable is required");
-}
-
-const client = new Anthropic({ apiKey: ANTHROPIC_API_KEY });
-
-// Anthropic Claude context window is 200k tokens
-// We'll compact when we approach ~150k tokens (roughly 75% of capacity)
-const CONTEXT_LIMIT_TOKENS = 150000;
-const ESTIMATED_TOKENS_PER_CHAR = 0.25; // Rough estimate: 4 chars per token
+// Compact when approaching 75% of 200k context window
+export const COMPACT_THRESHOLD = 150_000;
 
 export interface CoreMessage {
   role: "user" | "assistant" | "system";
   content: string;
 }
 
-function estimateTokens(messages: CoreMessage[]): number {
-  const totalChars = messages.reduce((sum, msg) => {
-    const content = typeof msg.content === "string" ? msg.content : JSON.stringify(msg.content);
-    return sum + content.length;
-  }, 0);
-  return Math.ceil(totalChars * ESTIMATED_TOKENS_PER_CHAR);
+/**
+ * Check if we should compact based on token usage
+ */
+export function shouldCompact(inputTokens: number): boolean {
+  return inputTokens > COMPACT_THRESHOLD;
 }
 
-export function shouldCompact(messages: CoreMessage[]): boolean {
-  return estimateTokens(messages) > CONTEXT_LIMIT_TOKENS;
+/**
+ * Check if error is due to context overflow
+ */
+export function isContextOverflowError(error: any): boolean {
+  const msg = String(error?.message || "").toLowerCase();
+  return msg.includes("context") || msg.includes("token") || msg.includes("too long");
 }
 
-export async function compactMessages(messages: CoreMessage[]): Promise<CoreMessage[]> {
+/**
+ * Compact messages by summarizing old conversation history
+ * Keeps: system messages, summary of old messages, last N messages
+ */
+export async function compactMessages(
+  messages: CoreMessage[], 
+  keepLast: number = 6
+): Promise<CoreMessage[]> {
   console.log("🔄 Compacting conversation history...");
+
+  const systemMsgs = messages.filter(m => m.role === "system");
+  const nonSystemMsgs = messages.filter(m => m.role !== "system");
   
-  // Keep the first user message and system messages
-  const systemMessages = messages.filter((m) => m.role === "system");
-  const firstUserMessage = messages.find((m) => m.role === "user");
-  const recentMessages = messages.slice(-10); // Keep last 10 messages for context
-  
-  // Create a summary prompt
-  const messagesToSummarize = messages.filter(
-    (m) => m.role !== "system" && m !== firstUserMessage && !recentMessages.includes(m)
-  );
-  
-  if (messagesToSummarize.length === 0) {
-    return messages; // Nothing to compact
+  // Keep last N messages
+  const recentMsgs = nonSystemMsgs.slice(-keepLast);
+  const oldMsgs = nonSystemMsgs.slice(0, -keepLast);
+
+  if (oldMsgs.length === 0) {
+    console.log("   Nothing to compact.");
+    return messages;
   }
-  
-  const conversationText = messagesToSummarize
-    .map((m) => `${m.role}: ${typeof m.content === "string" ? m.content : JSON.stringify(m.content)}`)
+
+  // Summarize old messages
+  const oldText = oldMsgs
+    .map(m => `${m.role.toUpperCase()}: ${m.content}`)
     .join("\n\n");
-  
-  const summaryPrompt = `Please provide a concise summary of the following conversation history, preserving all important decisions, code changes, and context that would be needed to continue the work:
-
-${conversationText}
-
-Provide a summary that captures:
-1. The main goals and objectives
-2. Key decisions made
-3. Important code changes or implementations
-4. Any errors encountered and how they were resolved
-5. Current state of the project
-
-Format the summary as a clear, structured narrative.`;
 
   try {
     const response = await client.messages.create({
       model: "claude-sonnet-4-20250514",
-      max_tokens: 4096,
-      messages: [{ role: "user", content: summaryPrompt }],
+      max_tokens: 2048,
+      messages: [{
+        role: "user",
+        content: `Summarize this conversation concisely, keeping key decisions, code changes, and context:\n\n${oldText}`
+      }],
     });
-    
+
     const summary = response.content
-      .filter((block): block is Anthropic.TextBlock => block.type === "text")
-      .map((block) => block.text)
+      .filter((b): b is Anthropic.TextBlock => b.type === "text")
+      .map(b => b.text)
       .join("");
-    
-    // Reconstruct messages: system messages, summary, then recent messages
-    const compacted: CoreMessage[] = [
-      ...systemMessages,
-      { role: "assistant" as const, content: `[Previous conversation summarized]: ${summary}` },
-      ...(firstUserMessage ? [firstUserMessage] : []),
-      ...recentMessages,
+
+    const result: CoreMessage[] = [
+      ...systemMsgs,
+      { role: "assistant", content: `[Summary of ${oldMsgs.length} previous messages]\n${summary}` },
+      ...recentMsgs,
     ];
-    
-    console.log(`✅ Compaction complete. Reduced ${messages.length} messages to ${compacted.length} messages.`);
-    return compacted;
+
+    console.log(`✅ Compacted: ${messages.length} → ${result.length} messages`);
+    return result;
   } catch (error) {
-    console.error("❌ Compaction failed, keeping original messages:", error);
-    return messages; // Fallback to original if compaction fails
+    console.error("❌ Compaction failed:", error);
+    // Fallback: just keep recent messages
+    return [...systemMsgs, ...recentMsgs];
   }
 }
