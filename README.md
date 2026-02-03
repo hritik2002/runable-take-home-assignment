@@ -6,14 +6,18 @@ A coding agent that automatically compacts conversation history when approaching
 
 ```bash
 bun install
-bun run index.ts
+bun start
 ```
 
 Requires Docker to be running.
 
 ## Environment Variables
 
-- `ANTHROPIC_API_KEY` - Required for the LLM
+- `ANTHROPIC_API_KEY` - Required. Your Anthropic API key (starts with `sk-ant-`)
+
+```bash
+export ANTHROPIC_API_KEY="sk-ant-api03-your-key-here"
+```
 
 ## Notes
 

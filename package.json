@@ -6,7 +6,9 @@
     "start": "bun run index.ts"
   },
   "dependencies": {
-    "ai": "^6.0.0",
+    "@ai-sdk/anthropic": "^3.0.35",
+    "@anthropic-ai/sdk": "^0.72.1",
+    "ai": "^6.0.68",
     "drizzle-orm": "^0.38.0",
     "zod": "^3.24.0"
   },
